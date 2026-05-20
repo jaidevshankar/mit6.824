@@ -1,6 +1,8 @@
 package kvsrv
 
 import (
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
@@ -30,9 +32,21 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	args := rpc.GetArgs{}
+	args.Key = key
+	for {
+		reply := rpc.GetReply{}
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+		if ok {
+			if reply.Err == rpc.OK {
+				return reply.Value, reply.Version, reply.Err
+			}
+			if reply.Err == rpc.ErrNoKey {
+				return "", 0, rpc.ErrNoKey
+			}
+		}
+	}
 }
-
 // Put updates key with value only if the version in the
 // request matches the version of the key at the server.  If the
 // versions numbers don't match, the server should return
@@ -52,5 +66,33 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return rpc.ErrNoKey
+	args := rpc.PutArgs{}
+	args.Key = key
+	args.Value = value
+	args.Version = version
+	first := true
+	for {
+		reply := rpc.PutReply{}
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+		if ok {
+			if reply.Err == rpc.OK {
+				return rpc.OK
+			}
+
+			if reply.Err == rpc.ErrNoKey {
+				return rpc.ErrNoKey
+			}
+
+			if reply.Err == rpc.ErrVersion && first {
+				return rpc.ErrVersion
+			}
+
+			if reply.Err == rpc.ErrVersion && !first {
+				return rpc.ErrMaybe
+			}
+		}
+
+		first = false
+		time.Sleep(100 * time.Millisecond)
+	}
 }

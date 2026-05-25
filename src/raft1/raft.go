@@ -19,6 +19,18 @@ import (
 	"6.5840/tester1"
 )
 
+type LogEntry struct {
+	Command string
+	Term int
+}
+
+type NodeState int
+
+const (
+	Follower NodeState = iota
+	Candidate
+	Leader
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -27,21 +39,44 @@ type Raft struct {
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	cv		  sync.Cond
+
+	electionTimeout time.Duration // election timeout period
+	lastRpcTime time.Time // last received RPC time, updated by RequestVote and AppendEntries?
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+
+	// persistent state
+	currentTerm int
+	votedFor int
+	log []LogEntry
+	state NodeState
+
+
+	// volatile state (all servers)
+	commitIndex int
+	lastApplied int
+	
+	// volatile state (leader-only)
+	nextIndex []int
+	matchIndex []int
+
+	// easy for calculations
+	numVotes int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term := rf.currentTerm
+	isLeader := (rf.state == Leader)
+	return term, isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -60,6 +95,7 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
 }
 
 
@@ -105,17 +141,109 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	
+	
+	reply.Success = false
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.lastRpcTime = time.Now()
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+	rf.state = Follower
+	reply.Term = args.Term
+	
+	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return
+	}
+
+	for i, entry := range args.Entries {
+		index := args.PrevLogIndex + 1 + i
+		
+		if index < len(rf.log) {
+			if rf.log[index].Term != entry.Term {
+				rf.log = rf.log[:index]
+				rf.log = append(rf.log, entry)
+			}
+		} else {
+			rf.log = append(rf.log, entry)
+		}
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
+	}
+
+	
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	
+
+	reply.VoteGranted = false
+
+	reply.Term = max(rf.currentTerm, args.Term)
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+	}
+
+	if args.Term < rf.currentTerm {
+		return
+	} 
+
+	upToDate := (args.LastLogTerm > rf.log[len(rf.log) - 1].Term) || (args.LastLogTerm == rf.log[len(rf.log) - 1].Term && args.LastLogIndex >= len(rf.log) - 1)
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.lastRpcTime = time.Now()
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -147,6 +275,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -193,19 +326,126 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) heartbeat() {
+	for rf.killed() == false {
+
+		term, isLeader := rf.GetState()
+
+		if isLeader {
+			rf.mu.Lock()
+			args := AppendEntriesArgs{}
+			args.LeaderCommit = rf.commitIndex
+			args.LeaderId = rf.me
+			args.PrevLogIndex = len(rf.log) - 1
+			args.PrevLogTerm = rf.log[len(rf.log) - 1].Term
+			args.Term = term
+			args.Entries = make([]LogEntry, 0)
+			
+			rf.mu.Unlock()
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me {
+					go func(peer int) {
+						reply := AppendEntriesReply{}
+
+						ok := rf.sendAppendEntries(peer, &args, &reply)
+
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+
+						if rf.currentTerm != args.Term { return }
+
+						if ok && reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.votedFor = -1
+							rf.state = Follower
+						}
+					}(i)
+				}
+			}
+
+		}
+			
+		
+
+		time.Sleep(120 * time.Millisecond)
+
+	}
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
+		rf.mu.Lock()
+		if time.Since(rf.lastRpcTime) > rf.electionTimeout && rf.state != Leader { // election time!
+			rf.state = Candidate
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			numVotes := 1
+
+			args := RequestVoteArgs{}
+			args.CandidateId = rf.me
+			args.LastLogIndex = len(rf.log) - 1
+			args.LastLogTerm = rf.log[len(rf.log) - 1].Term
+			args.Term = rf.currentTerm
+			
+
+			ms := 900 + (rand.Int63() % 200)
+			rf.electionTimeout = time.Duration(ms) * time.Millisecond
+			rf.lastRpcTime = time.Now()
+
+			rf.mu.Unlock()
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me {
+					go func(peer int) {
+						
+						reply := RequestVoteReply{}
+
+						ok := rf.sendRequestVote(peer, &args, &reply)
+
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+
+						if rf.currentTerm != args.Term { return }
+
+						if ok && reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.votedFor = -1
+							rf.state = Follower
+						}
+
+						if ok && reply.VoteGranted && rf.state == Candidate {
+							numVotes++
+
+							if numVotes >= (len(rf.peers) + 1) / 2 {
+								rf.state = Leader
+								for i := 0; i < len(rf.peers); i++ {
+									rf.nextIndex[i] = len(rf.log)
+									rf.matchIndex[i] = 0
+								}
+							}
+						}
+					}(i)
+				}
+			}
+		} else {
+			rf.mu.Unlock()
+		}
+
+		
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		// ms := 50 + (rand.Int63() % 300)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+
+
+
 
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -224,12 +464,34 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
-
+	
+	
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	ms := 900 + (rand.Int63() % 200)
+	rf.electionTimeout = time.Duration(ms) * time.Millisecond
+	rf.lastRpcTime = time.Now()
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = make([]LogEntry, 1)
+	rf.log[0].Term = 0
+	
+	rf.state = Follower
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = 1
+		rf.matchIndex[i] = 0
+	}
+
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.heartbeat()
 
 
 	return rf

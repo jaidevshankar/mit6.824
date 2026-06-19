@@ -174,43 +174,49 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	
-	
-	reply.Success = false
+
 	if args.Term < rf.currentTerm {
+		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
 
 	rf.lastRpcTime = time.Now()
+
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.state = Follower
 	}
-	rf.state = Follower
-	reply.Term = args.Term
-	
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm
+
+	if len(rf.log) - 1 >= args.PrevLogIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
 		return
 	}
 
-	for i, entry := range args.Entries {
-		index := args.PrevLogIndex + 1 + i
-		
-		if index < len(rf.log) {
-			if rf.log[index].Term != entry.Term {
-				rf.log = rf.log[:index]
-				rf.log = append(rf.log, entry)
-			}
-		} else {
-			rf.log = append(rf.log, entry)
+	i := args.PrevLogIndex + 1
+	j := 0
+	for i < len(rf.log) {
+		if rf.log[i].Term != args.Entries[j].Term {
+			rf.log = rf.log[:i]
 		}
+		j++
+		i++
+	}
+
+	for j < len(args.Entries) {
+		rf.log = append(rf.log, args.Entries[j])
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
 	}
 
-	
+	reply.Success = true
+	reply.Term = rf.currentTerm
 }
 
 // example RequestVote RPC handler.
@@ -222,28 +228,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	
 
-	reply.VoteGranted = false
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
 
-	reply.Term = max(rf.currentTerm, args.Term)
+	rf.lastRpcTime = time.Now()
 
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = Follower
 		rf.votedFor = -1
+		rf.state = Follower
 	}
 
-	if args.Term < rf.currentTerm {
-		return
-	} 
+	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm
 
-	upToDate := (args.LastLogTerm > rf.log[len(rf.log) - 1].Term) || (args.LastLogTerm == rf.log[len(rf.log) - 1].Term && args.LastLogIndex >= len(rf.log) - 1)
-
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		rf.lastRpcTime = time.Now()
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		moreUpToDate := (args.LastLogTerm > rf.log[len(rf.log) - 1].Term) || (args.LastLogTerm == rf.log[len(rf.log) - 1].Term && args.LastLogIndex	>= len(rf.log) - 1)
+		if moreUpToDate {
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+		}
 	}
-
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -329,43 +336,46 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 
-		term, isLeader := rf.GetState()
+		rf.mu.Lock()
+		
+		if rf.state == Leader {
+			rf.mu.Unlock()
 
-		if isLeader {
-			rf.mu.Lock()
 			args := AppendEntriesArgs{}
-			args.LeaderCommit = rf.commitIndex
+			args.Entries = make([]LogEntry, 0)
+
+			rf.mu.Lock()
+			args.Term = rf.currentTerm
 			args.LeaderId = rf.me
+			args.LeaderCommit = rf.commitIndex
 			args.PrevLogIndex = len(rf.log) - 1
 			args.PrevLogTerm = rf.log[len(rf.log) - 1].Term
-			args.Term = term
-			args.Entries = make([]LogEntry, 0)
-			
+
 			rf.mu.Unlock()
+
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
+
 					go func(peer int) {
 						reply := AppendEntriesReply{}
+						rf.sendAppendEntries(i, &args, &reply)
 
-						ok := rf.sendAppendEntries(peer, &args, &reply)
-
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
-
-						if rf.currentTerm != args.Term { return }
-
-						if ok && reply.Term > rf.currentTerm {
+						if reply.Term > args.Term {
+							rf.mu.Lock()
 							rf.currentTerm = reply.Term
-							rf.votedFor = -1
 							rf.state = Follower
-						}
+							rf.votedFor = -1
+							rf.mu.Unlock()
+							return
+						}	
 					}(i)
+					
 				}
 			}
-
+		} else {
+			rf.mu.Unlock()
 		}
-			
-		
+
 
 		time.Sleep(120 * time.Millisecond)
 
@@ -377,63 +387,73 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
-
 		rf.mu.Lock()
-		if time.Since(rf.lastRpcTime) > rf.electionTimeout && rf.state != Leader { // election time!
-			rf.state = Candidate
+		if time.Since(rf.lastRpcTime) > rf.electionTimeout && rf.state != Leader {
+			
 			rf.currentTerm++
+			rf.state = Candidate
 			rf.votedFor = rf.me
-			numVotes := 1
-
+			rf.lastRpcTime = time.Now()
+			ms := 800 + (rand.Int63() % 200)
+			rf.electionTimeout = time.Duration(ms * int64(time.Millisecond))
+			
+			rf.mu.Unlock()	
 			args := RequestVoteArgs{}
 			args.CandidateId = rf.me
+			rf.mu.Lock()
 			args.LastLogIndex = len(rf.log) - 1
 			args.LastLogTerm = rf.log[len(rf.log) - 1].Term
 			args.Term = rf.currentTerm
-			
-
-			ms := 900 + (rand.Int63() % 200)
-			rf.electionTimeout = time.Duration(ms) * time.Millisecond
-			rf.lastRpcTime = time.Now()
-
 			rf.mu.Unlock()
+
+			numVotes := 1
+
 			for i := 0; i < len(rf.peers); i++ {
+
+				rf.mu.Lock()
+				if rf.state == Follower {
+					rf.mu.Unlock()
+					break
+				}
+				rf.mu.Unlock()
+
 				if i != rf.me {
+
 					go func(peer int) {
-						
 						reply := RequestVoteReply{}
+						rf.sendRequestVote(i, &args, &reply)
 
-						ok := rf.sendRequestVote(peer, &args, &reply)
-
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
-
-						if rf.currentTerm != args.Term { return }
-
-						if ok && reply.Term > rf.currentTerm {
+						if reply.Term > args.Term {
+							rf.mu.Lock()
 							rf.currentTerm = reply.Term
-							rf.votedFor = -1
 							rf.state = Follower
+							rf.votedFor = -1
+							rf.mu.Unlock()
+							return
 						}
 
-						if ok && reply.VoteGranted && rf.state == Candidate {
+						if reply.VoteGranted {
 							numVotes++
-
 							if numVotes >= (len(rf.peers) + 1) / 2 {
+								rf.mu.Lock()
 								rf.state = Leader
 								for i := 0; i < len(rf.peers); i++ {
 									rf.nextIndex[i] = len(rf.log)
 									rf.matchIndex[i] = 0
 								}
+								rf.mu.Unlock()
+								return
 							}
 						}
 					}(i)
+					
+
 				}
 			}
+
 		} else {
 			rf.mu.Unlock()
 		}
-
 		
 
 		// pause for a random amount of time between 50 and 350
